@@ -1,0 +1,241 @@
+diff --git a/Makefile b/Makefile
+index 0f4a4fe..3528b6e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -95,6 +95,8 @@ RELEASE_DOCKER_ONLY ?= false
+ 
+ DOCKER_MACHINE_ARM64_NAME?=docker-machine-arm64-${USER}
+ 
++KONG_WITH_MODSECURITY_IMAGE ?= leandrocarneiro/kong:$(KONG_VERSION)-ubuntu-modsecurity
++
+ GITHUB_TOKEN ?=
+ 
+ # set to 'plain' to get less dynamic, but linear output from docker build(x)
+@@ -140,7 +142,7 @@ else ifeq ($(RESTY_IMAGE_BASE),alpine)
+ endif
+ 
+ ifeq ($(BUILDX),false)
+-	DOCKER_COMMAND?=docker buildx build --progress=$(DOCKER_BUILD_PROGRESS) $(KONG_EE_PORTS_FLAG) --platform="linux/amd64" $(DOCKER_LABELS)
++	DOCKER_COMMAND?=docker buildx build --progress=$(DOCKER_BUILD_PROGRESS) $(KONG_EE_PORTS_FLAG) $(DOCKER_LABELS)
+ else
+ 	DOCKER_COMMAND?=docker buildx build --progress=$(DOCKER_BUILD_PROGRESS) $(KONG_EE_PORTS_FLAG) --push --platform="linux/amd64,linux/arm64" $(DOCKER_LABELS)
+ endif
+@@ -220,6 +222,32 @@ else ifeq ($(BUILDX),true)
+ 	-docker-machine rm --force ${DOCKER_MACHINE_ARM64_NAME}
+ endif
+ 
++build-kong-image-with-modsecurity: setup-kong-source
++	$(DOCKER_COMMAND) -f dockerfiles/Dockerfile.openresty \
++		--build-arg RESTY_VERSION=$(RESTY_VERSION) \
++		--build-arg RESTY_LUAROCKS_VERSION=$(RESTY_LUAROCKS_VERSION) \
++		--build-arg KONG_OPENSSL_VERSION=$(KONG_OPENSSL_VERSION) \
++		--build-arg RESTY_OPENSSL_VERSION=$(RESTY_OPENSSL_VERSION) \
++		--build-arg RESTY_BORINGSSL_VERSION=$(RESTY_BORINGSSL_VERSION) \
++		--build-arg SSL_PROVIDER=$(SSL_PROVIDER) \
++		--build-arg RESTY_PCRE_VERSION=$(RESTY_PCRE_VERSION) \
++		--build-arg PACKAGE_TYPE=$(PACKAGE_TYPE) \
++		--build-arg DOCKER_REPOSITORY=$(DOCKER_REPOSITORY) \
++		--build-arg DOCKER_BASE_SUFFIX=$(DOCKER_BASE_SUFFIX) \
++		--build-arg EDITION=$(EDITION) \
++		--build-arg ENABLE_KONG_LICENSING=$(ENABLE_KONG_LICENSING) \
++		--build-arg KONG_NGINX_MODULE=$(KONG_NGINX_MODULE) \
++		--build-arg RESTY_LMDB=$(RESTY_LMDB) \
++		--build-arg RESTY_WEBSOCKET=$(RESTY_WEBSOCKET) \
++		--build-arg RESTY_EVENTS=$(RESTY_EVENTS) \
++		--build-arg ATC_ROUTER=$(ATC_ROUTER) \
++		--build-arg OPENRESTY_PATCHES=$(OPENRESTY_PATCHES) \
++		--build-arg DEBUG=$(DEBUG) \
++		--build-arg BUILDKIT_INLINE_CACHE=1 \
++		--build-arg KONG_VERSION=$(KONG_VERSION) \
++		--build-arg WITH_MODSECURITY=1 \
++		-t $(KONG_WITH_MODSECURITY_IMAGE) .
++
+ build-openresty: setup-kong-source
+ ifeq ($(RESTY_IMAGE_BASE),src)
+ 	@echo "nothing to be done"
+diff --git a/build-openresty.sh b/build-openresty.sh
+index 0498b0b..99e8209 100755
+--- a/build-openresty.sh
++++ b/build-openresty.sh
+@@ -72,6 +72,12 @@ then
+   KONG_OPENSSL_VERSION=0
+ fi
+ 
++MODSECURITY_ENABLED=""
++if [ "$WITH_MODSECURITY" == "1" ]
++then
++  MODSECURITY_ENABLED="--modsecurity-enabled"
++fi
++
+ LUAROCKS_PREFIX=/usr/local \
+ LUAROCKS_DESTDIR=/tmp/build \
+ OPENRESTY_PREFIX=/usr/local/openresty \
+@@ -95,6 +101,7 @@ ENABLE_KONG_LICENSING=$ENABLE_KONG_LICENSING \
+ --luarocks $RESTY_LUAROCKS_VERSION \
+ --kong-nginx-module $KONG_NGINX_MODULE \
+ --pcre $RESTY_PCRE_VERSION \
++$MODSECURITY_ENABLED \
+ --work /work $KONG_NGX_BUILD_ARGS >> $BUILD_OUTPUT 2>&1
+ 
+ 
+diff --git a/dockerfiles/Dockerfile.openresty b/dockerfiles/Dockerfile.openresty
+index fd9d689..dcc5b5f 100644
+--- a/dockerfiles/Dockerfile.openresty
++++ b/dockerfiles/Dockerfile.openresty
+@@ -3,12 +3,13 @@
+ ARG DOCKER_BASE_SUFFIX
+ ARG DOCKER_REPOSITORY
+ ARG PACKAGE_TYPE
++ARG KONG_VERSION
+ 
+ FROM kong/kong-build-tools:apk-1.8.3 as APK
+ FROM kong/kong-build-tools:deb-1.8.3 as DEB
+ FROM kong/kong-build-tools:rpm-1.8.3 as RPM
+ 
+-FROM $PACKAGE_TYPE
++FROM $PACKAGE_TYPE as modsecurity
+ 
+ ARG EDITION="community"
+ ENV EDITION $EDITION
+@@ -63,6 +64,9 @@ COPY build-openresty.sh /tmp/build-openresty.sh
+ ARG OPENRESTY_PATCHES=1
+ ENV OPENRESTY_PATCHES="${OPENRESTY_PATCHES}"
+ 
++ARG WITH_MODSECURITY=0
++ENV WITH_MODSECURITY="${WITH_MODSECURITY}"
++
+ COPY lua-kong-nginx-module /distribution/lua-kong-nginx-module
+ COPY lua-resty-lmdb /distribution/lua-resty-lmdb
+ 
+@@ -80,4 +84,32 @@ COPY kong/.requirements kong/distribution/ /distribution/
+ WORKDIR /distribution
+ 
+ ENV ENABLE_KONG_LICENSING=false
+-RUN --mount=type=secret,id=github-token if [ -f "/distribution/post-install.sh" ] ; then export GITHUB_TOKEN=`cat /run/secrets/github-token` && ./post-install.sh; fi
++
++FROM  --platform=$TARGETPLATFORM kong:${KONG_VERSION}-ubuntu
++
++COPY --from=modsecurity /tmp/build/usr/local/openresty/nginx/modules/ngx_http_modsecurity_module.so /modsecurity/modules/ngx_http_modsecurity_module.so
++COPY --from=modsecurity /usr/local/modsecurity/lib/libmodsecurity.so.3.0.9 /modsecurity/lib/libmodsecurity.so.3.0.9
++COPY --from=modsecurity /usr/lib/*/libGeoIP.so.1.6.12 /modsecurity/lib/libGeoIP.so.1.6.12
++COPY --from=modsecurity /usr/lib/*/libxml2.so.2.9.4 /modsecurity/lib/libxml2.so.2.9.4
++COPY --from=modsecurity /usr/lib/*/liblmdb.so.0.0.0 /modsecurity/lib/liblmdb.so.0.0.0
++COPY --from=modsecurity /usr/local/lib/libfuzzy.so.2.1.0 /modsecurity/lib/libfuzzy.so.2.1.0
++COPY --from=modsecurity /usr/lib/*/libyajl.so.2.1.0 /modsecurity/lib/libyajl.so.2.1.0
++COPY --from=modsecurity /usr/lib/*/libicuuc.so.60.2 /modsecurity/lib/libicuuc.so.60.2
++COPY --from=modsecurity /usr/lib/*/libicudata.so.60.2 /modsecurity/lib/libicudata.so.60.2
++COPY --from=modsecurity /tmp/coreruleset /modsecurity/coreruleset
++COPY --from=modsecurity /tmp/modsec /modsecurity/modsec
++COPY --from=modsecurity /tmp/loadmodule_modsecurity.conf /modsecurity/loadmodule_modsecurity.conf
++COPY --from=modsecurity /tmp/enable_modsecurity.conf /modsecurity/enable_modsecurity.conf
++
++USER root
++
++RUN ln -s /modsecurity/lib/libmodsecurity.so.3.0.9 /lib/libmodsecurity.so.3 && \
++    ln -s /modsecurity/lib/libGeoIP.so.1.6.12 /lib/libGeoIP.so.1 && \
++    ln -s /modsecurity/lib/libxml2.so.2.9.4 /lib/libxml2.so.2 && \
++    ln -s /modsecurity/lib/liblmdb.so.0.0.0 /lib/liblmdb.so.0 && \
++    ln -s /modsecurity/lib/libfuzzy.so.2.1.0 /lib/libfuzzy.so.2 && \
++    ln -s /modsecurity/lib/libyajl.so.2.1.0 /lib/libyajl.so.2 && \
++    ln -s /modsecurity/lib/libicuuc.so.60.2 /lib/libicuuc.so.60 && \
++    ln -s /modsecurity/lib/libicudata.so.60.2 /lib/libicudata.so.60
++
++USER kong
+diff --git a/openresty-build-tools/kong-ngx-build b/openresty-build-tools/kong-ngx-build
+index 73b2cb6..defa398 100755
+--- a/openresty-build-tools/kong-ngx-build
++++ b/openresty-build-tools/kong-ngx-build
+@@ -30,7 +30,7 @@ DIST=
+ DIST_VER=
+ NGINX_EXTRA_MODULES=()
+ KONG_DISTRIBUTION_PATH=${KONG_DISTRIBUTION_PATH:-/distribution}
+-
++MODSECURITY_ENABLED=0
+ PARAMS=""
+ 
+ main() {
+@@ -97,6 +97,10 @@ main() {
+         OPENRESTY_PATCHES=0
+         shift 1
+         ;;
++      --modsecurity-enabled)
++        MODSECURITY_ENABLED=1
++        shift 1
++        ;;
+       --kong-nginx-module)
+         KONG_NGINX_MODULE=$2
+         shift 2
+@@ -751,6 +755,61 @@ main() {
+     fi
+   fi
+ 
++  if [[ $MODSECURITY_ENABLED == 1 ]]; then
++    pushd $DOWNLOAD_CACHE
++    curl -Lo ssdeep.tar.gz https://github.com/ssdeep-project/ssdeep/releases/download/release-2.14.1/ssdeep-2.14.1.tar.gz
++    tar xzvf ssdeep.tar.gz && cd ssdeep-2.14.1
++    ./configure && ./bootstrap && make -j$NPROC && make install
++    popd
++
++    pushd $DOWNLOAD_CACHE
++    apt-get update
++    apt install -y \
++      libyajl-dev \
++      libcurl4-gnutls-dev \
++      liblmdb-dev
++      # libluajit-5.1-dev \
++    export MODSECURITY_VERSION=3.0.9
++    git clone https://github.com/SpiderLabs/ModSecurity
++    cd ModSecurity
++    git remote add stanhu https://github.com/stanhu/ModSecurity.git
++    # git remote add fzipi https://github.com/fzipi/ModSecurity.git
++    git fetch stanhu
++    # git fetch fzipi
++    git checkout tags/v${MODSECURITY_VERSION}
++    git config --global user.email "mod@security.com"
++    git config --global user.name "modsecurity"
++    git merge --no-ff --no-edit stanhu/sh-use-pkgconfig-first-add-luajit
++    # git merge --no-ff --no-edit fzipi/fix-pcre2-config-usage
++    git submodule init
++    git submodule update
++    ./build.sh
++    # ./configure
++    ./configure --with-lmdb
++    make -j$NPROC
++    make install
++    popd
++
++    pushd $DOWNLOAD_CACHE
++    export MODSECURITY_NGINX_VERSION=1.0.3
++    git clone https://github.com/SpiderLabs/ModSecurity-nginx.git
++    cd ModSecurity-nginx
++    git checkout tags/v${MODSECURITY_NGINX_VERSION}
++    popd
++
++    git clone https://github.com/coreruleset/coreruleset /tmp/coreruleset
++    mv /tmp/coreruleset/crs-setup.conf.example /tmp/coreruleset/crs-setup.conf
++    mv /tmp/coreruleset/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf.example /tmp/coreruleset/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf
++    mkdir -p /tmp/modsec
++    cp $DOWNLOAD_CACHE/ModSecurity/unicode.mapping /tmp/modsec/unicode.mapping
++    cp $DOWNLOAD_CACHE/ModSecurity/modsecurity.conf-recommended /tmp/modsec/modsecurity.conf
++    sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' /tmp/modsec/modsecurity.conf
++    echo -e "Include /modsecurity/modsec/modsecurity.conf\nInclude /modsecurity/coreruleset/crs-setup.conf\nInclude /modsecurity/coreruleset/rules/*.conf" >> /tmp/modsec/main.conf
++    echo 'load_module /modsecurity/modules/ngx_http_modsecurity_module.so;' > /tmp/loadmodule_modsecurity.conf
++    echo -e 'modsecurity on;\nmodsecurity_rules_file /modsecurity/modsec/main.conf;' >> /tmp/enable_modsecurity.conf
++  fi
++
++
+   # Building OpenResty
+ 
+   if [ ! -f $OPENRESTY_INSTALL/nginx/sbin/nginx ]; then
+@@ -780,6 +839,11 @@ main() {
+           "-j$NPROC"
+         )
+ 
++        if [[ $MODSECURITY_ENABLED == 1 ]]; then
++          OPENRESTY_OPTS+=("--add-dynamic-module=../ModSecurity-nginx")
++          # OPENRESTY_OPTS+=("--with-compat")
++        fi
++
+         if [ "$EDITION" == 'enterprise' ]; then
+           if [ "$ENABLE_KONG_LICENSING" != "false" ]; then
+             OPENRESTY_OPTS+=("--add-module=$KONG_DISTRIBUTION_PATH/kong-licensing/ngx_module")
