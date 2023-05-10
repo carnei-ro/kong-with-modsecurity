@@ -17,7 +17,7 @@ on:
   #   - cron: "0 0 * * *" # every day at midnight, to test against nightlies
 
 jobs:
-  test:
+  create-image:
     runs-on: ubuntu-latest
 
     strategy:
@@ -53,6 +53,8 @@ jobs:
       - name: Build
         continue-on-error: false
         run: |
+          git config --global url.https://github.com/.insteadOf git@github.com:
+
           git clone https://github.com/Kong/kong.git
           cd kong
           git checkout tags/$KONG_VERSION
@@ -61,7 +63,8 @@ jobs:
           git clone https://github.com/Kong/kong-build-tools.git
           cd kong-build-tools
           git checkout tags/$KONG_BUILD_TOOLS_VERSION
-          patch < ../kong-build-tools.patch
+          cp ../kong-build-tools.patch .
+          patch -p1 < ./kong-build-tools.patch
 
           make build-kong-image-with-modsecurity
         env:
@@ -69,3 +72,5 @@ jobs:
           KONG_WITH_MODSECURITY_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.kongVersion }}-ubuntu
           KONG_BUILD_TOOLS_VERSION: "4.42.1"
           BUILDX: 'true'
+          DOCKER_PLATFORM: --platform='linux/amd64,linux/arm64'
+          DOCKER_PUSH: --push
